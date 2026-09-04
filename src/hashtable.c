@@ -16,17 +16,11 @@ typedef enum hashtable_slot_state
     SLOT_BUSY = 1,
 } hashtable_slot_state_t;
 
-typedef struct hashtable_slot
-{
-    uint8_t state;
-    uint64_t hash;
-    void *value;
-} hashtable_slot_t;
-
 typedef struct hashtable_bucket
 {
-    size_t len;
-    hashtable_slot_t slots[HASHTABLE_BUCKET_SLOTS];
+    uint8_t slot_states;
+    uint64_t hashes[HASHTABLE_BUCKET_SLOTS];
+    void *values[HASHTABLE_BUCKET_SLOTS];
     struct hashtable_bucket *next;
 } hashtable_bucket_t;
 
@@ -42,6 +36,57 @@ void hashtable_bucket_init_chain(hashtable_bucket_t *bucket)
 void hashtable_bucket_destroy(hashtable_bucket_t *bucket)
 {
     free(bucket);
+}
+
+uint8_t hashtable_bucket_num_free_slots(hashtable_bucket_t *bucket)
+{
+    return HASHTABLE_BUCKET_SLOTS - __builtin_popcount(bucket->slot_states);
+}
+
+int8_t hashtable_bucket_first_free_slot(hashtable_bucket_t *bucket)
+{
+    uint8_t free_bits = (uint8_t)~bucket->slot_states;
+    return free_bits ? __builtin_ctz((unsigned)free_bits) : -1;
+}
+
+// slot state
+void hashtable_bucket_set_slot_state(hashtable_bucket_t *bucket, int8_t slot_idx, uint8_t state)
+{
+    if (state)
+    {
+        bucket->slot_states |= (uint8_t)(1U << slot_idx);
+    }
+    else
+    {
+        bucket->slot_states &= (uint8_t)~(1U << slot_idx);
+    }
+}
+
+uint8_t hashtable_bucket_get_slot_state(hashtable_bucket_t *bucket, int8_t slot_idx)
+{
+    return (bucket->slot_states & (uint8_t)(1U << slot_idx)) != 0;
+}
+
+// hash
+void hashtable_bucket_set_slot_hash(hashtable_bucket_t *bucket, int8_t slot_idx, uint64_t hash)
+{
+    bucket->hashes[slot_idx] = hash;
+}
+
+uint64_t hashtable_bucket_get_slot_hash(hashtable_bucket_t *bucket, int8_t slot_idx)
+{
+    return bucket->hashes[slot_idx];
+}
+
+// value
+void hashtable_bucket_set_slot_value(hashtable_bucket_t *bucket, int8_t slot_idx, void *value)
+{
+    bucket->values[slot_idx] = value;
+}
+
+void *hashtable_bucket_get_slot_value(hashtable_bucket_t *bucket, int8_t slot_idx)
+{
+    return bucket->values[slot_idx];
 }
 
 struct hashtable
@@ -71,7 +116,8 @@ hashtable_t *hashtable_init(size_t cap, bool free_empty_chained_buckets)
     // prefault for benchmark
     for (size_t i = 0; i < cap; i++)
     {
-        buckets[i].len = 0;
+        volatile uint8_t *state = &buckets[i].slot_states;
+        *state = 0;
     }
 
     table->buckets = buckets;
@@ -100,106 +146,6 @@ void hashtable_destroy(hashtable_t *table)
     free(table);
 }
 
-hashtable_slot_t *hashtable_find_empty_slot_chained(hashtable_bucket_t *bucket, hashtable_bucket_t **bucket_out)
-{
-
-    hashtable_bucket_t *current = bucket;
-    hashtable_bucket_t *next = bucket->next;
-
-    for (;;)
-    {
-        if (next == NULL)
-        {
-            hashtable_bucket_init_chain(current);
-            *bucket_out = current->next;
-            return &current->next->slots[0];
-        }
-
-        for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
-        {
-            if (next->slots[i].state != SLOT_BUSY)
-            {
-                *bucket_out = next;
-                return &next->slots[i];
-            }
-        }
-
-        current = next;
-        next = current->next;
-    }
-}
-
-hashtable_slot_t *hashtable_find_item_slot_chained(hashtable_bucket_t *bucket, uint64_t hash, hashtable_bucket_t **bucket_out)
-{
-
-    hashtable_bucket_t *current = bucket->next;
-
-    for (;;)
-    {
-        if (current == NULL)
-            return NULL;
-
-        for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
-        {
-            if (current->slots[i].state == SLOT_BUSY &&
-                current->slots[i].hash == hash)
-            {
-                if (bucket_out)
-                    *bucket_out = current;
-                return &current->slots[i];
-            }
-        }
-
-        current = current->next;
-    }
-}
-
-hashtable_slot_t *hashtable_find_item_slot_or_next_free_slot_chained(hashtable_bucket_t *bucket, uint64_t hash,
-                                                                     hashtable_slot_t *free_slot,
-                                                                     hashtable_bucket_t **bucket_out)
-{
-    hashtable_bucket_t *prev_bucket = bucket;
-    hashtable_bucket_t *current_bucket = bucket->next;
-
-    for (;;)
-    {
-        if (current_bucket == NULL)
-        {
-            if (free_slot)
-                return free_slot;
-
-            hashtable_bucket_init_chain(prev_bucket);
-
-            *bucket_out = prev_bucket->next;
-            return &prev_bucket->next->slots[0];
-        }
-
-        for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
-        {
-            hashtable_slot_t *slot = &current_bucket->slots[i];
-
-            if (slot->state == SLOT_BUSY && slot->hash == hash)
-            {
-                if (bucket_out)
-                    *bucket_out = current_bucket;
-
-                return slot;
-            }
-
-            if (slot->state == SLOT_EMPTY && !free_slot)
-            {
-                free_slot = slot;
-
-                if (bucket_out)
-                    *bucket_out = current_bucket;
-            }
-        }
-
-        prev_bucket = current_bucket;
-        current_bucket = current_bucket->next;
-    }
-}
-
 void hashtable_free_bucket_if_chained(hashtable_t *table, hashtable_bucket_t *bucket, size_t bucket_idx)
 {
     hashtable_bucket_t *parent = &table->buckets[bucket_idx];
@@ -220,57 +166,120 @@ void hashtable_free_bucket_if_chained(hashtable_t *table, hashtable_bucket_t *bu
     }
 }
 
-hashtable_slot_t *hashtable_find_empty_slot(hashtable_t *table, size_t bucket_idx, hashtable_bucket_t **bucket_out)
+int8_t hashtable_find_item_slot_chained(hashtable_bucket_t *bucket, uint64_t hash, hashtable_bucket_t **bucket_out)
 {
-    for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
-    {
-        if (table->buckets[bucket_idx].slots[i].state != SLOT_BUSY)
-        {
-            *bucket_out = &table->buckets[bucket_idx];
-            return &table->buckets[bucket_idx].slots[i];
-        }
-    }
 
-    return hashtable_find_empty_slot_chained(&table->buckets[bucket_idx], bucket_out);
+    hashtable_bucket_t *current = bucket->next;
+
+    for (;;)
+    {
+        if (current == NULL)
+            return -1;
+
+        for (int8_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
+        {
+            uint8_t slot_state = hashtable_bucket_get_slot_state(current, i);
+            uint64_t slot_hash = hashtable_bucket_get_slot_hash(current, i);
+
+            if (slot_state == SLOT_BUSY && slot_hash == hash)
+            {
+                if (bucket_out)
+                    *bucket_out = current;
+                return i;
+            }
+        }
+
+        current = current->next;
+    }
 }
 
-hashtable_slot_t *hashtable_find_item_slot(hashtable_t *table, size_t bucket_idx, uint64_t hash, hashtable_bucket_t **bucket_out)
+int8_t hashtable_find_item_slot_or_next_free_slot_chained(hashtable_bucket_t *bucket, uint64_t hash,
+                                                          int8_t free_slot,
+                                                          hashtable_bucket_t **bucket_out)
 {
-    for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
+    hashtable_bucket_t *prev_bucket = bucket;
+    hashtable_bucket_t *current_bucket = bucket->next;
+
+    for (;;)
     {
-        if (table->buckets[bucket_idx].slots[i].state == SLOT_BUSY &&
-            table->buckets[bucket_idx].slots[i].hash == hash)
+        if (current_bucket == NULL)
+        {
+            if (free_slot >= 0)
+                return free_slot;
+
+            hashtable_bucket_init_chain(prev_bucket);
+
+            *bucket_out = prev_bucket->next;
+            return hashtable_bucket_first_free_slot(prev_bucket->next);
+        }
+
+        for (int8_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
+        {
+            uint8_t slot_state = hashtable_bucket_get_slot_state(current_bucket, i);
+            uint64_t slot_hash = hashtable_bucket_get_slot_hash(current_bucket, i);
+
+            if (slot_state == SLOT_BUSY && slot_hash == hash)
+            {
+                if (bucket_out)
+                    *bucket_out = current_bucket;
+
+                return i;
+            }
+
+            if (slot_state == SLOT_EMPTY && free_slot < 0)
+            {
+                free_slot = i;
+
+                if (bucket_out)
+                    *bucket_out = current_bucket;
+            }
+        }
+
+        prev_bucket = current_bucket;
+        current_bucket = current_bucket->next;
+    }
+}
+
+int8_t hashtable_find_item_slot(hashtable_t *table, size_t bucket_idx, uint64_t hash, hashtable_bucket_t **bucket_out)
+{
+    for (uint8_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
+    {
+        hashtable_bucket_t *bucket = &table->buckets[bucket_idx];
+
+        if (hashtable_bucket_get_slot_state(bucket, i) == SLOT_BUSY &&
+            hashtable_bucket_get_slot_hash(bucket, i) == hash)
         {
             if (bucket_out)
                 *bucket_out = &table->buckets[bucket_idx];
-            return &table->buckets[bucket_idx].slots[i];
+            return i;
         }
     }
 
     return hashtable_find_item_slot_chained(&table->buckets[bucket_idx], hash, bucket_out);
 }
 
-hashtable_slot_t *hashtable_find_item_slot_or_next_free_slot(hashtable_t *table, size_t bucket_idx, uint64_t hash, hashtable_bucket_t **bucket_out)
+int8_t hashtable_find_item_slot_or_next_free_slot(hashtable_t *table, size_t bucket_idx, uint64_t hash, hashtable_bucket_t **bucket_out)
 {
 
     hashtable_bucket_t *bucket = &table->buckets[bucket_idx];
-    hashtable_slot_t *free_slot = NULL;
+    int8_t free_slot = -1;
 
-    for (size_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
+    for (uint8_t i = 0; i < HASHTABLE_BUCKET_SLOTS; i++)
     {
-        hashtable_slot_t *slot = &bucket->slots[i];
+        uint8_t slot_state = hashtable_bucket_get_slot_state(bucket, i);
+        uint64_t slot_hash = hashtable_bucket_get_slot_hash(bucket, i);
 
-        if (slot->state == SLOT_BUSY && slot->hash == hash)
+        if (slot_state == SLOT_BUSY && slot_hash == hash)
         {
             if (bucket_out)
                 *bucket_out = bucket;
 
-            return slot;
+            return i;
         }
 
-        if (slot->state == SLOT_EMPTY && !free_slot)
+        if (slot_state == SLOT_EMPTY && free_slot < 0)
         {
-            free_slot = slot;
+            free_slot = i;
 
             if (bucket_out)
                 *bucket_out = bucket;
@@ -282,55 +291,55 @@ hashtable_slot_t *hashtable_find_item_slot_or_next_free_slot(hashtable_t *table,
 
 bool hashtable_set(hashtable_t *table, const uint8_t *key, size_t key_len, void *value)
 {
-    XXH64_hash_t hash = XXH64(key, key_len, 0);
+
+    XXH64_hash_t hash = XXH3_64bits(key, key_len);
     size_t bucket_idx = (size_t)(hash & (table->bucket_count - 1));
 
     hashtable_bucket_t *bucket;
-    hashtable_slot_t *item_slot = hashtable_find_item_slot_or_next_free_slot(table, bucket_idx, (uint64_t)hash, &bucket);
+    int8_t slot_idx = hashtable_find_item_slot_or_next_free_slot(table, bucket_idx, (uint64_t)hash, &bucket);
 
-    if (item_slot->state == SLOT_EMPTY)
+    if (hashtable_bucket_get_slot_state(bucket, slot_idx) == SLOT_EMPTY)
     {
-        item_slot->state = SLOT_BUSY;
-        item_slot->hash = hash;
+        hashtable_bucket_set_slot_state(bucket, slot_idx, SLOT_BUSY);
+        hashtable_bucket_set_slot_hash(bucket, slot_idx, hash);
 
         table->len++;
-        bucket->len++;
     }
 
-    item_slot->value = value;
+    hashtable_bucket_set_slot_value(bucket, slot_idx, value);
 
     return true;
 }
 
 void *hashtable_get(hashtable_t *table, const uint8_t *key, size_t key_len)
 {
-    XXH64_hash_t hash = XXH64(key, key_len, 0);
+    XXH64_hash_t hash = XXH3_64bits(key, key_len);
     size_t bucket_idx = (size_t)(hash & (table->bucket_count - 1));
 
-    hashtable_slot_t *item_slot = hashtable_find_item_slot(table, bucket_idx, (uint64_t)hash, NULL);
-    if (!item_slot)
+    hashtable_bucket_t *bucket;
+    int8_t slot_idx = hashtable_find_item_slot(table, bucket_idx, (uint64_t)hash, &bucket);
+    if (slot_idx < 0)
         return NULL;
 
-    return item_slot->value;
+    return hashtable_bucket_get_slot_value(bucket, slot_idx);
 }
 
 void hashtable_delete(hashtable_t *table, const uint8_t *key, size_t key_len)
 {
-    XXH64_hash_t hash = XXH64(key, key_len, 0);
+    XXH64_hash_t hash = XXH3_64bits(key, key_len);
     size_t bucket_idx = (size_t)(hash & (table->bucket_count - 1));
 
     hashtable_bucket_t *bucket;
-    hashtable_slot_t *item_slot = hashtable_find_item_slot(table, bucket_idx, (uint64_t)hash, &bucket);
-    if (!item_slot)
+    int8_t slot_idx = hashtable_find_item_slot(table, bucket_idx, (uint64_t)hash, &bucket);
+    if (slot_idx < 0)
         return;
 
-    item_slot->hash = 0;
-    item_slot->state = SLOT_EMPTY;
-    item_slot->value = NULL;
+    hashtable_bucket_set_slot_state(bucket, slot_idx, SLOT_EMPTY);
+    hashtable_bucket_set_slot_hash(bucket, slot_idx, 0);
+    hashtable_bucket_set_slot_value(bucket, slot_idx, NULL);
 
     table->len--;
-    bucket->len--;
 
-    if (bucket->len == 0 && table->free_empty_chained_buckets)
+    if (table->free_empty_chained_buckets && hashtable_bucket_num_free_slots(bucket) == HASHTABLE_BUCKET_SLOTS)
         hashtable_free_bucket_if_chained(table, bucket, bucket_idx);
 }
