@@ -1,0 +1,68 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/clang",
+      "-Isrc",
+      "-Ivendor/xxhash",
+      "-std=c17",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Wshadow",
+      "-Wstrict-prototypes",
+      "-O0",
+      "-g3",
+      "-c",
+      "-o",
+      "build/hashtable.o",
+      "src/hashtable.c"
+    ],
+    "directory": "/home/ubuntu/projects/kv",
+    "file": "/home/ubuntu/projects/kv/src/hashtable.c",
+    "output": "/home/ubuntu/projects/kv/build/hashtable.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/clang",
+      "-Isrc",
+      "-Ivendor/xxhash",
+      "-std=c17",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Wshadow",
+      "-Wstrict-prototypes",
+      "-O0",
+      "-g3",
+      "-c",
+      "-o",
+      "build/main.o",
+      "src/main.c"
+    ],
+    "directory": "/home/ubuntu/projects/kv",
+    "file": "/home/ubuntu/projects/kv/src/main.c",
+    "output": "/home/ubuntu/projects/kv/build/main.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/clang",
+      "-Isrc",
+      "-Ivendor/xxhash",
+      "-std=c17",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-Wshadow",
+      "-Wstrict-prototypes",
+      "-O0",
+      "-g3",
+      "-c",
+      "-o",
+      "build/vendor/xxhash.o",
+      "vendor/xxhash/xxhash.c"
+    ],
+    "directory": "/home/ubuntu/projects/kv",
+    "file": "/home/ubuntu/projects/kv/vendor/xxhash/xxhash.c",
+    "output": "/home/ubuntu/projects/kv/build/vendor/xxhash.o"
+  }
+]
