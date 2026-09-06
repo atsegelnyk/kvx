@@ -3,6 +3,7 @@ PROJECT := kv
 CC := clang
 
 SRC_DIR := src
+TEST_DIR := test
 BENCH_DIR := bench
 BUILD_DIR := build
 VENDOR_DIR := vendor
@@ -18,6 +19,8 @@ SRC := $(wildcard $(SRC_DIR)/*.c)
 LIB_SRC := $(filter-out $(SRC_DIR)/main.c,$(SRC))
 
 VENDOR_SRC := $(VENDOR_DIR)/xxhash/xxhash.c
+
+TEST_SRC := $(TEST_DIR)/hashtable_test.c
 
 BENCH_SRC := $(BENCH_DIR)/hashtable_bench.c
 
@@ -39,6 +42,8 @@ LIB_OBJ := $(patsubst $(SRC_DIR)/%.c,$(OUT_DIR)/src/%.o,$(LIB_SRC))
 
 VENDOR_OBJ := $(OUT_DIR)/vendor/xxhash.o
 
+TEST_OBJ := $(OUT_DIR)/test/hashtable_test.o
+
 BENCH_OBJ := $(OUT_DIR)/bench/hashtable_bench.o
 
 APP_OBJ += $(VENDOR_OBJ)
@@ -49,6 +54,7 @@ LIB_OBJ += $(VENDOR_OBJ)
 # ---------------------------------------------------------------------------
 
 TARGET := $(OUT_DIR)/$(PROJECT)
+TEST_TARGET := $(OUT_DIR)/hashtable_test
 BENCH_TARGET := $(OUT_DIR)/hashtable_bench
 
 # ---------------------------------------------------------------------------
@@ -83,6 +89,11 @@ CFLAGS_SANITIZE := \
 	-fsanitize=address,undefined \
 	-fno-omit-frame-pointer
 
+CFLAGS_TEST := \
+	-O3 \
+	-DNDEBUG \
+	-march=native
+
 CFLAGS_BENCH := \
 	-O3 \
 	-DNDEBUG \
@@ -94,6 +105,8 @@ else ifeq ($(MODE),release)
 	CFLAGS := $(CFLAGS_COMMON) $(CFLAGS_RELEASE)
 else ifeq ($(MODE),sanitize)
 	CFLAGS := $(CFLAGS_COMMON) $(CFLAGS_SANITIZE)
+else ifeq ($(MODE),test)
+	CFLAGS := $(CFLAGS_COMMON) $(CFLAGS_TEST)
 else ifeq ($(MODE),bench)
 	CFLAGS := $(CFLAGS_COMMON) $(CFLAGS_BENCH)
 else
@@ -140,6 +153,31 @@ $(OUT_DIR)/src/%.o: $(SRC_DIR)/%.c
 $(OUT_DIR)/vendor/xxhash.o: $(VENDOR_SRC)
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+# ---------------------------------------------------------------------------
+# unit test
+# ---------------------------------------------------------------------------
+
+$(TEST_OBJ): $(TEST_SRC)
+	@mkdir -p $(dir $@)
+	$(CC) $(BENCH_CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(TEST_TARGET): $(TEST_OBJ) $(LIB_OBJ)
+	@mkdir -p $(dir $@)
+	$(CC) $(LDFLAGS) $(TEST_OBJ) $(LIB_OBJ) $(LDLIBS) -o $@
+
+.PHONY: _test-build
+_test-build: $(TEST_TARGET)
+
+.PHONY: test-build
+test-build:
+	$(MAKE) MODE=test test-build
+
+.PHONY: test
+test:
+	$(MAKE) MODE=test _test-build
+	./$(BUILD_DIR)/test/hashtable_test
+
 
 # ---------------------------------------------------------------------------
 # Benchmark
