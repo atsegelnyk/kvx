@@ -9,7 +9,6 @@
 #include <string.h>
 
 #include "item.h"
-#include "pages.h"
 
 #define SLAB_SIZE (1UL << 21)
 
@@ -34,7 +33,8 @@ struct slab_t
 {
     size_t chunk_size;
 
-    void *next_chunk;
+    void *free_list;
+    uint8_t *bump; // next never-used chunk
     size_t free_count;
 
     slab_class_t *parent_slab_class;
@@ -46,33 +46,23 @@ static slab_t *slab_init(size_t data_chunk_size, slab_class_t *parent_slab_class
 {
     size_t chunk_size = align_up(data_chunk_size, alignof(item_t));
 
-    size_t free_count = (SLAB_SIZE - sizeof(slab_t)) / chunk_size;
-
-    slab_t *slab = pages_map(SLAB_SIZE, NULL);
+    slab_t *slab = malloc(SLAB_SIZE);
     if (!slab)
         abort();
 
     slab->chunk_size = chunk_size;
+    slab->free_list = NULL;
+    slab->bump = slab->mem;
+    slab->free_count = (SLAB_SIZE - sizeof(slab_t)) / chunk_size;
     slab->parent_slab_class = parent_slab_class;
-    slab->next_chunk = &slab->mem[0];
-    slab->free_count = free_count;
-
-    for (size_t i = 0; i < free_count; i++)
-    {
-        void *current = &slab->mem[i * chunk_size];
-        void *next = NULL;
-        if (i + 1 < free_count)
-            next = &slab->mem[(i + 1) * chunk_size];
-
-        memcpy(current, &next, sizeof(next));
-    }
 
     return slab;
 }
 
 static void slab_destroy(slab_t *slab)
 {
-    pages_unmap(slab, SLAB_SIZE);
+    free(slab);
+    // pages_unmap(slab, SLAB_SIZE);
 }
 
 static item_t *slab_alloc_item(slab_t *slab)
@@ -80,17 +70,23 @@ static item_t *slab_alloc_item(slab_t *slab)
     if (slab->free_count == 0)
         return NULL;
 
-    void *current = slab->next_chunk;
-    void *next;
+    item_t *item;
 
-    item_t *item = (item_t *)(current);
-    memcpy(&next, current, sizeof(next));
+    if (slab->free_list)
+    {
+        item = slab->free_list;
+        memcpy(&slab->free_list, item, sizeof(void *));
+    }
+    else
+    {
+        item = (item_t *)slab->bump;
+        slab->bump += slab->chunk_size;
+    }
+
+    slab->free_count--;
 
     item->slab_ptr = slab;
-    item->data_size = slab->chunk_size;
-
-    slab->next_chunk = next;
-    slab->free_count--;
+    item->data_size = slab->chunk_size - ITEM_SIZE;
 
     return item;
 }
@@ -99,10 +95,9 @@ void slab_allocator_free_item(item_t *item)
 {
     slab_t *slab = item->slab_ptr;
 
-    memcpy(item, &slab->next_chunk, sizeof(slab->next_chunk));
-
+    memcpy(item, &slab->free_list, sizeof(void *));
+    slab->free_list = item;
     slab->free_count++;
-    slab->next_chunk = item;
 
     slab_class_free_item(slab->parent_slab_class, slab);
 }

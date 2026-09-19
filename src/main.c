@@ -1,9 +1,7 @@
-#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include "kv.h"
-#include "xxhash.h"
 
 #include <stdio.h>
 
