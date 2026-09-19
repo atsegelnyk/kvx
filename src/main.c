@@ -1,26 +1,36 @@
-#include "hashtable.h"
-#include "xxhash.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
-#define HASHTABLE_BUCKET_SLOTS 8
-#define HASHTABLE_SCALE_AT_FACTOR 7 / 8
+#include "kv.h"
+#include "xxhash.h"
+
+#include <stdio.h>
 
 int main(void)
 {
-    char *A = "AAAAAAAAAAA";
-    char *B = "BBBBBBBBBBB";
 
-    hashtable_t *table = hashtable_init(8);
+    kv_t *kv = kv_init();
 
-    hashtable_set(table, (const uint8_t *)"A", 2, A);
-    hashtable_set(table, (const uint8_t *)"B", 2, B);
+    uint8_t buf[100];
+    size_t buf_len = 100;
 
-    printf("%s\n", (char *)hashtable_get(table, (const uint8_t *)"A", 2));
-    printf("%s\n", (char *)hashtable_get(table, (const uint8_t *)"B", 2));
-    printf("%s\n", (char *)hashtable_get(table, (const uint8_t *)"B", 2));
+    size_t value_len;
+
+    uint16_t flags;
+    uint32_t exp;
+
+    kv_set(kv, (const uint8_t *)"A", 2, (const uint8_t *)"AAAAA", 6, 1, 999999999);
+    kv_get(kv, (const uint8_t *)"A", 2, buf, buf_len, &value_len, &flags, &exp);
+    printf("key: %s  flags: %d exp: %d\n", buf, flags, exp);
+
+    kv_set(kv, (const uint8_t *)"A", 2, (const uint8_t *)"BBBBB", 6, 1, 999999999);
+    kv_get(kv, (const uint8_t *)"A", 2, buf, buf_len, &value_len, &flags, &exp);
+    printf("key: %s  flags: %d exp: %d\n", buf, flags, exp);
+
+    kv_set(kv, (const uint8_t *)"A", 2, (const uint8_t *)"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC", 67, 1, 999999999);
+    kv_get(kv, (const uint8_t *)"A", 2, buf, buf_len, &value_len, &flags, &exp);
+    printf("key: %s  flags: %d exp: %d\n", buf, flags, exp);
 
     return 0;
 }

@@ -8,6 +8,8 @@
 #include <string.h>
 
 #include "hashtable.h"
+#include "item.h"
+#include "xxhash.h"
 
 /* ------------------------------------------------------------ framework */
 
@@ -40,12 +42,15 @@ static const char *g_current_test;
         }                                                                    \
     } while (0)
 
+static void pool_reset(void);
+
 #define RUN(fn)                                         \
     do                                                  \
     {                                                   \
         g_current_test = #fn;                           \
         int before = g_failures;                        \
         fn();                                           \
+        pool_reset();                                   \
         printf("%-42s %s\n", #fn,                       \
                g_failures == before ? "ok" : "FAILED"); \
     } while (0)
@@ -58,17 +63,6 @@ static inline uint64_t splitmix64(uint64_t *state)
     z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
     z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
     return z ^ (z >> 31);
-}
-
-/* Values are (index + 1) as a pointer: never NULL, and self-identifying so a
-   lookup returning the wrong entry is caught rather than just a wrong count. */
-static inline void *val_of(size_t i)
-{
-    return (void *)(uintptr_t)(i + 1);
-}
-static inline size_t idx_of(void *v)
-{
-    return (size_t)(uintptr_t)v - 1;
 }
 
 /* Deterministic key for index i. Distinct lengths exercise the hash on
@@ -94,22 +88,137 @@ static tkey_t make_key(size_t i)
     return k;
 }
 
-static void ht_put(hashtable_t *t, size_t i)
+/* ------------------------------------------------------------ item pool
+
+   item_t has a flexible array member and no constructor, so the test owns
+   item storage. Every item carries one uint64_t payload, self-identifying so
+   a lookup returning the wrong entry is caught rather than just a wrong count.
+
+   Ownership: the table stores these pointers and must not free them.
+   pool_reset() runs after each test; if hashtable_destroy also frees items,
+   that shows up immediately as a double free under ASan. */
+
+typedef struct item_pool
 {
-    tkey_t k = make_key(i);
-    hashtable_set(t, k.bytes, k.len, val_of(i));
+    item_t **items;
+    size_t count;
+    size_t cap;
+} item_pool_t;
+
+static item_pool_t g_pool;
+
+/* Returned by fetch helpers when the lookup missed. Distinct from every
+   value the tests store. */
+#define NO_ITEM SIZE_MAX
+
+static item_t *make_item(const uint8_t *key, size_t key_len, uint64_t value)
+{
+    item_t *item = malloc(sizeof(item_t) + key_len + sizeof value);
+
+    if (!item)
+    {
+        fprintf(stderr, "out of memory allocating item\n");
+        exit(EXIT_FAILURE);
+    }
+
+    item->key_len = (uint16_t)key_len;
+    item->flags = 0;
+    item->value_len = (uint32_t)sizeof value;
+    item->expire_at = 0;
+
+    if (key_len)
+        item_set_key(item, key, key_len);
+    item_set_value(item, (const uint8_t *)&value, sizeof value);
+
+    if (g_pool.count == g_pool.cap)
+    {
+        size_t cap = g_pool.cap ? g_pool.cap * 2 : 1024;
+        item_t **grown = realloc(g_pool.items, cap * sizeof(item_t *));
+
+        if (!grown)
+        {
+            fprintf(stderr, "out of memory growing item pool\n");
+            exit(EXIT_FAILURE);
+        }
+
+        g_pool.items = grown;
+        g_pool.cap = cap;
+    }
+
+    g_pool.items[g_pool.count++] = item;
+    return item;
 }
 
-static void *ht_fetch(hashtable_t *t, size_t i)
+static void pool_reset(void)
+{
+    for (size_t i = 0; i < g_pool.count; i++)
+        free(g_pool.items[i]);
+
+    free(g_pool.items);
+    g_pool.items = NULL;
+    g_pool.count = 0;
+    g_pool.cap = 0;
+}
+
+static size_t item_value_u64(item_t *item)
+{
+    size_t len;
+    uint8_t *value = item_value(item, &len);
+    uint64_t out;
+
+    if (len != sizeof out)
+        return NO_ITEM;
+
+    memcpy(&out, value, sizeof out);
+    return (size_t)out;
+}
+
+/* ------------------------------------------------------------ table ops */
+
+static void ht_put_value(hashtable_t *t, size_t i, uint64_t value)
 {
     tkey_t k = make_key(i);
-    return hashtable_get(t, k.bytes, k.len);
+
+    XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+    item_t **item_ref = hashtable_set(t, hash, k.bytes, k.len);
+    *item_ref = make_item(k.bytes, k.len, value);
+}
+
+static void ht_put(hashtable_t *t, size_t i)
+{
+    ht_put_value(t, i, i);
+}
+
+/* Value stored under key i, or NO_ITEM if the key is absent. Also verifies
+   the returned item actually carries the key that was asked for, which
+   catches a probe that returns the wrong slot. */
+static size_t ht_fetch_value(hashtable_t *t, size_t i)
+{
+    tkey_t k = make_key(i);
+    XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+    item_t *item = hashtable_get(t, hash, k.bytes, k.len);
+
+    if (!item)
+        return NO_ITEM;
+
+    if (!item_key_matches(item, k.bytes, k.len))
+    {
+        g_failures++;
+        fprintf(stderr, "  FAIL in %s: get(key %zu) returned an item with a "
+                        "different key\n",
+                g_current_test, i);
+        return NO_ITEM;
+    }
+
+    return item_value_u64(item);
 }
 
 static void ht_del(hashtable_t *t, size_t i)
 {
     tkey_t k = make_key(i);
-    hashtable_delete(t, k.bytes, k.len);
+
+    XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+    hashtable_delete(t, hash, k.bytes, k.len);
 }
 
 /* --------------------------------------------------------------- basics */
@@ -139,8 +248,8 @@ static void test_empty_table(void)
     hashtable_t *t = hashtable_init(64);
 
     CHECK_EQ_SIZE(hashtable_len(t), 0);
-    CHECK(ht_fetch(t, 0) == NULL);
-    CHECK(ht_fetch(t, 12345) == NULL);
+    CHECK_EQ_SIZE(ht_fetch_value(t, 0), NO_ITEM);
+    CHECK_EQ_SIZE(ht_fetch_value(t, 12345), NO_ITEM);
 
     /* Deleting from an empty table must not underflow len. */
     ht_del(t, 7);
@@ -155,16 +264,16 @@ static void test_set_get_delete_roundtrip(void)
 
     ht_put(t, 42);
     CHECK_EQ_SIZE(hashtable_len(t), 1);
-    CHECK(ht_fetch(t, 42) == val_of(42));
+    CHECK_EQ_SIZE(ht_fetch_value(t, 42), 42);
 
     ht_del(t, 42);
     CHECK_EQ_SIZE(hashtable_len(t), 0);
-    CHECK(ht_fetch(t, 42) == NULL);
+    CHECK_EQ_SIZE(ht_fetch_value(t, 42), NO_ITEM);
 
     /* Slot must be reusable after deletion. */
     ht_put(t, 42);
     CHECK_EQ_SIZE(hashtable_len(t), 1);
-    CHECK(ht_fetch(t, 42) == val_of(42));
+    CHECK_EQ_SIZE(ht_fetch_value(t, 42), 42);
 
     hashtable_destroy(t);
 }
@@ -172,14 +281,13 @@ static void test_set_get_delete_roundtrip(void)
 static void test_overwrite_does_not_change_len(void)
 {
     hashtable_t *t = hashtable_init(64);
-    tkey_t k = make_key(9);
 
-    hashtable_set(t, k.bytes, k.len, val_of(1));
-    hashtable_set(t, k.bytes, k.len, val_of(2));
-    hashtable_set(t, k.bytes, k.len, val_of(3));
+    ht_put_value(t, 9, 1);
+    ht_put_value(t, 9, 2);
+    ht_put_value(t, 9, 3);
 
     CHECK_EQ_SIZE(hashtable_len(t), 1);
-    CHECK(hashtable_get(t, k.bytes, k.len) == val_of(3));
+    CHECK_EQ_SIZE(ht_fetch_value(t, 9), 3);
 
     hashtable_destroy(t);
 }
@@ -197,7 +305,7 @@ static void test_delete_absent_key(void)
     CHECK_EQ_SIZE(hashtable_len(t), 50);
 
     for (size_t i = 0; i < 50; i++)
-        CHECK(ht_fetch(t, i) == val_of(i));
+        CHECK_EQ_SIZE(ht_fetch_value(t, i), i);
 
     hashtable_destroy(t);
 }
@@ -212,7 +320,7 @@ static void test_no_false_positives(void)
     /* Keys never inserted must miss. Catches a hash-only compare that
        matches on truncated or colliding fingerprints. */
     for (size_t i = 100000; i < 110000; i++)
-        CHECK(ht_fetch(t, i) == NULL);
+        CHECK_EQ_SIZE(ht_fetch_value(t, i), NO_ITEM);
 
     hashtable_destroy(t);
 }
@@ -222,12 +330,24 @@ static void test_zero_length_key(void)
     hashtable_t *t = hashtable_init(64);
     uint8_t dummy = 0;
 
-    hashtable_set(t, &dummy, 0, val_of(1));
-    CHECK_EQ_SIZE(hashtable_len(t), 1);
-    CHECK(hashtable_get(t, &dummy, 0) == val_of(1));
+    XXH64_hash_t hash = XXH3_64bits(&dummy, 0);
+    item_t **item_ref = hashtable_set(t, hash, &dummy, 0);
+    *item_ref = make_item(&dummy, 0, 1);
 
-    hashtable_delete(t, &dummy, 0);
+    CHECK_EQ_SIZE(hashtable_len(t), 1);
+
+    hash = XXH3_64bits(&dummy, 0);
+    item_t *item = hashtable_get(t, hash, &dummy, 0);
+    CHECK(item != NULL);
+    if (item)
+        CHECK_EQ_SIZE(item_value_u64(item), 1);
+
+    hash = XXH3_64bits(&dummy, 0);
+    hashtable_delete(t, hash, &dummy, 0);
     CHECK_EQ_SIZE(hashtable_len(t), 0);
+
+    hash = XXH3_64bits(&dummy, 0);
+    CHECK(hashtable_get(t, hash, &dummy, 0) == NULL);
 
     hashtable_destroy(t);
 }
@@ -245,7 +365,7 @@ static void test_bucket_chaining(void)
 
     CHECK_EQ_SIZE(hashtable_len(t), n);
     for (size_t i = 0; i < n; i++)
-        CHECK(ht_fetch(t, i) == val_of(i));
+        CHECK_EQ_SIZE(ht_fetch_value(t, i), i);
 
     /* Delete every third key, then verify the survivors: exercises removal
        from chained buckets and any empty-chain reclamation. */
@@ -258,20 +378,14 @@ static void test_bucket_chaining(void)
 
     CHECK_EQ_SIZE(hashtable_len(t), n - deleted);
     for (size_t i = 0; i < n; i++)
-    {
-        void *v = ht_fetch(t, i);
-        if (i % 3 == 0)
-            CHECK(v == NULL);
-        else
-            CHECK(v == val_of(i));
-    }
+        CHECK_EQ_SIZE(ht_fetch_value(t, i), (i % 3 == 0) ? NO_ITEM : i);
 
     /* Refill: freed chain slots must be reusable. */
     for (size_t i = 0; i < n; i += 3)
         ht_put(t, i);
     CHECK_EQ_SIZE(hashtable_len(t), n);
     for (size_t i = 0; i < n; i++)
-        CHECK(ht_fetch(t, i) == val_of(i));
+        CHECK_EQ_SIZE(ht_fetch_value(t, i), i);
 
     hashtable_destroy(t);
 }
@@ -303,10 +417,10 @@ static void test_growth_preserves_every_key(void)
 
     for (size_t i = 0; i < n; i++)
     {
-        void *v = ht_fetch(t, i);
-        if (v != val_of(i))
+        size_t v = ht_fetch_value(t, i);
+        if (v != i)
         {
-            CHECK(v == val_of(i));
+            CHECK_EQ_SIZE(v, i);
             break;
         }
     }
@@ -334,10 +448,10 @@ static void test_lookups_during_migration(void)
        sits in the migrated prefix or the untouched tail. */
     for (size_t i = 0; i < inserted; i++)
     {
-        void *v = ht_fetch(t, i);
-        if (v != val_of(i))
+        size_t v = ht_fetch_value(t, i);
+        if (v != i)
         {
-            CHECK(v == val_of(i));
+            CHECK_EQ_SIZE(v, i);
             break;
         }
     }
@@ -366,19 +480,16 @@ static void test_overwrite_during_migration(void)
     /* Rewriting existing keys must not create a second copy in the new
        table while the original still lives in the old one. */
     for (size_t i = 0; i < inserted; i += 7)
-    {
-        tkey_t k = make_key(i);
-        hashtable_set(t, k.bytes, k.len, val_of(i + 1000000));
-    }
+        ht_put_value(t, i, i + 1000000);
 
     CHECK_EQ_SIZE(hashtable_len(t), len_before);
 
     for (size_t i = 0; i < inserted; i += 7)
     {
-        void *v = ht_fetch(t, i);
-        if (v != val_of(i + 1000000))
+        size_t v = ht_fetch_value(t, i);
+        if (v != i + 1000000)
         {
-            CHECK(v == val_of(i + 1000000));
+            CHECK_EQ_SIZE(v, i + 1000000);
             break;
         }
     }
@@ -413,9 +524,9 @@ static void test_delete_during_migration(void)
     CHECK_EQ_SIZE(hashtable_len(t), inserted - deleted);
 
     for (size_t i = 0; i < inserted; i += 5)
-        if (ht_fetch(t, i) != NULL)
+        if (ht_fetch_value(t, i) != NO_ITEM)
         {
-            CHECK(ht_fetch(t, i) == NULL);
+            CHECK_EQ_SIZE(ht_fetch_value(t, i), NO_ITEM);
             break;
         }
 
@@ -425,9 +536,9 @@ static void test_delete_during_migration(void)
         ht_put(t, i);
 
     for (size_t i = 0; i < inserted; i += 5)
-        if (ht_fetch(t, i) != NULL)
+        if (ht_fetch_value(t, i) != NO_ITEM)
         {
-            CHECK(ht_fetch(t, i) == NULL);
+            CHECK_EQ_SIZE(ht_fetch_value(t, i), NO_ITEM);
             fprintf(stderr, "  (key %zu resurrected after migration completed)\n", i);
             break;
         }
@@ -461,12 +572,14 @@ static void test_repeated_fill_and_drain(void)
 
 /* Independent reference map: open addressing with tombstones, FNV-1a. Shares
    no code with the table under test, so the two are unlikely to agree on a
-   wrong answer. */
+   wrong answer. Stores the same item pointer the table was handed, so the
+   comparison below is pointer identity: the table must return the exact
+   item most recently set, not merely one with an equal value. */
 typedef struct
 {
     uint8_t *key;
     size_t len;
-    void *val;
+    item_t *val;
     uint8_t state;
 } ref_slot_t;
 typedef struct
@@ -504,7 +617,7 @@ static void ref_free(ref_t *r)
 
 static void ref_grow(ref_t *r);
 
-static void ref_set(ref_t *r, const uint8_t *k, size_t n, void *v)
+static void ref_set(ref_t *r, const uint8_t *k, size_t n, item_t *v)
 {
     if ((r->used + 1) * 2 > r->cap)
         ref_grow(r);
@@ -554,7 +667,7 @@ static void ref_grow(ref_t *r)
     *r = bigger;
 }
 
-static void *ref_get(ref_t *r, const uint8_t *k, size_t n)
+static item_t *ref_get(ref_t *r, const uint8_t *k, size_t n)
 {
     size_t i = ref_hash(k, n) & (r->cap - 1);
     for (;;)
@@ -613,28 +726,38 @@ static void differential_stress(uint64_t seed, size_t ops, size_t key_space)
         case 3:
         case 4:
         case 5: /* 60% set */
-            hashtable_set(t, k.bytes, k.len, val_of(i));
-            ref_set(&r, k.bytes, k.len, val_of(i));
+        {
+            item_t *item = make_item(k.bytes, k.len, i);
+            XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+            item_t **item_ref = hashtable_set(t, hash, k.bytes, k.len);
+            *item_ref = item;
+
+            ref_set(&r, k.bytes, k.len, item);
             break;
+        }
         case 6:
         case 7:
         case 8: /* 30% get */
         {
-            void *a = hashtable_get(t, k.bytes, k.len);
-            void *b = ref_get(&r, k.bytes, k.len);
+            XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+            item_t *a = hashtable_get(t, hash, k.bytes, k.len);
+            item_t *b = ref_get(&r, k.bytes, k.len);
             if (a != b)
             {
                 mismatches++;
                 fprintf(stderr,
                         "  op %zu: get(key %zu) = %p, reference = %p\n",
-                        op, i, a, b);
+                        op, i, (void *)a, (void *)b);
             }
             break;
         }
         default: /* 10% delete */
-            hashtable_delete(t, k.bytes, k.len);
+        {
+            XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+            hashtable_delete(t, hash, k.bytes, k.len);
             ref_del(&r, k.bytes, k.len);
             break;
+        }
         }
 
         if (hashtable_len(t) != r.len)
@@ -652,12 +775,14 @@ static void differential_stress(uint64_t seed, size_t ops, size_t key_space)
     for (size_t i = 0; i < key_space && sweep_bad < 5; i++)
     {
         tkey_t k = make_key(i);
-        void *a = hashtable_get(t, k.bytes, k.len);
-        void *b = ref_get(&r, k.bytes, k.len);
+        XXH64_hash_t hash = XXH3_64bits(k.bytes, k.len);
+        item_t *a = hashtable_get(t, hash, k.bytes, k.len);
+        item_t *b = ref_get(&r, k.bytes, k.len);
         if (a != b)
         {
             sweep_bad++;
-            fprintf(stderr, "  sweep: key %zu = %p, reference = %p\n", i, a, b);
+            fprintf(stderr, "  sweep: key %zu = %p, reference = %p\n",
+                    i, (void *)a, (void *)b);
         }
     }
     CHECK_EQ_SIZE(sweep_bad, 0);
