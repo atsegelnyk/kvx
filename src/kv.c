@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "kv.h"
 
 #include <pthread.h>
@@ -29,7 +31,11 @@ static void kv_shard_init(kv_shard_t *shard)
 {
     shard->allocator = slab_allocator_init();
     shard->table = hashtable_init(KV_SHARD_TABLE_INITIAL_SIZE);
-    pthread_mutex_init(&shard->mu, NULL);
+
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_ADAPTIVE_NP);
+    pthread_mutex_init(&shard->mu, &attr);
 }
 
 static void kv_shard_destroy(kv_shard_t *shard)
